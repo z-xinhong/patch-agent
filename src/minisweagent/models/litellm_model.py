@@ -47,6 +47,7 @@ class LitellmModelConfig(BaseModel):
 
 
 class LitellmModel:
+    tools = [BASH_TOOL]
     abort_exceptions: list[type[Exception]] = [
         litellm.exceptions.UnsupportedParamsError,
         litellm.exceptions.NotFoundError,
@@ -61,12 +62,17 @@ class LitellmModel:
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
+    def _completion(self, messages: list[dict[str, str]], **params):
+        return litellm.completion(model=self.config.model_name, messages=messages, **params)
+
+    def _retry(self):
+        return retry(logger=logger, abort_exceptions=self.abort_exceptions)
+
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
-            return litellm.completion(
-                model=self.config.model_name,
-                messages=messages,
-                tools=[BASH_TOOL],
+            return self._completion(
+                messages,
+                tools=self.tools,
                 **(self.config.model_kwargs | kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
@@ -79,9 +85,10 @@ class LitellmModel:
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
+        prepared = self._prepare_messages_for_api(messages)
+        for attempt in self._retry():
             with attempt:
-                response = self._query(self._prepare_messages_for_api(messages), **kwargs)
+                response = self._query(prepared, **kwargs)
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
         # Note: all model.query() implementations must persist the response and cost on FormatError.

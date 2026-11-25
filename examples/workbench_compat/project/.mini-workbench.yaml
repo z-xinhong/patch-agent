@@ -1,0 +1,2 @@
+preflight: [python3, --version]
+verify: [python3, smoke.py]

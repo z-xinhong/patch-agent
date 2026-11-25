@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>mini-SWE-agent 工作台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark" aria-hidden="true"><b></b><i></i></span> mini-SWE-agent <span class="product">工作台</span></div>
+    <div class="connection"><span class="dot"></span><span id="connection">正在连接</span></div>
+  </header>
+  <main class="layout">
+    <aside class="sidebar" aria-label="会话列表">
+      <div class="panel-heading"><h2>项目会话</h2><button id="new-session" class="square" title="新建会话" aria-label="新建会话" type="button">+</button></div>
+      <form id="workspace-form" class="workspace-form" hidden>
+        <label for="workspace">工作区目录</label>
+        <input id="workspace" name="workspace" placeholder="/home/user/projects/my-project" autocomplete="off" required>
+        <button class="primary" type="submit">创建会话</button>
+      </form>
+      <nav id="sessions" aria-label="工作区会话"></nav>
+      <p class="sidebar-note">会话按工作区保存在本地，重启工作台后可以继续。</p>
+    </aside>
+
+    <section class="conversation" aria-label="Agent 对话">
+      <header class="conversation-header">
+        <div><h1 id="title">工作台</h1><p id="current-workspace" class="path">选择一个工作区开始</p></div>
+        <div class="session-actions">
+          <div class="session-state" id="session-state">待创建</div>
+          <button type="button" class="quiet danger" id="delete-session" hidden>删除会话</button>
+        </div>
+      </header>
+      <section class="resume-card" id="resume-card" aria-label="续做现场" hidden>
+        <strong>续做现场</strong>
+        <p id="resume-goal"></p>
+        <p id="resume-action"></p>
+        <button class="quiet" id="resume-diff" type="button">查看当前文件改动</button>
+      </section>
+      <div class="timeline" id="timeline" aria-live="polite">
+        <div class="welcome">
+          <div class="terminal-mark" aria-hidden="true"><span>&gt;</span><span>_</span></div>
+          <h2 id="welcome-title">从一个工作区开始</h2>
+          <p id="welcome-text">在左侧创建会话，然后告诉 Agent 你想做什么。</p>
+          <div class="suggestions" id="suggestions" hidden>
+            <button type="button" data-prompt="看看这个项目的目录和测试入口，先介绍一下项目结构。">查看项目结构</button>
+            <button type="button" data-prompt="检查这个项目如何运行测试，运行测试并告诉我结果。">运行项目测试</button>
+          </div>
+        </div>
+        <div id="events"></div>
+      </div>
+      <div class="composer-area">
+        <div class="approval" id="approval" hidden>
+          <div class="approval-heading"><span class="dot"></span><strong id="approval-title">等待命令确认</strong></div>
+          <pre id="approval-commands"></pre>
+          <div class="approval-buttons"><button type="button" id="reject">拒绝</button><button type="button" id="approve" class="primary">批准执行</button></div>
+        </div>
+        <p id="error" class="error" role="alert" hidden></p>
+        <form id="composer" class="composer">
+          <label for="message" class="sr-only">输入需求</label>
+          <textarea id="message" rows="2" placeholder="描述任务，或追加一个需求…" required disabled></textarea>
+          <div class="composer-footer"><span>Ctrl + Enter 发送</span><button class="primary" id="send" type="submit" disabled>发送</button><button class="danger" id="stop-turn" type="button" hidden>停止本轮</button></div>
+        </form>
+      </div>
+    </section>
+
+    <aside class="inspector" aria-label="工作区检查器">
+      <div class="tabs" role="group" aria-label="检查器视图">
+        <button id="changes-tab" aria-pressed="true" type="button">文件改动</button>
+        <button id="tools-tab" aria-pressed="false" type="button">命令记录</button>
+        <button id="context-tab" aria-pressed="false" type="button">上下文</button>
+      </div>
+      <div class="verification-status" id="verification-state" hidden></div>
+      <div class="inspector-meta">
+        <span id="inspector-label">会话开始以来</span>
+        <button class="quiet" id="refresh-changes" type="button" disabled>刷新</button>
+      </div>
+      <div class="panel-body" id="changes"><p class="empty">会话中的文件改动会显示在这里。</p></div>
+      <div class="panel-body" id="tools" hidden><p class="empty">执行后的命令和退出码会显示在这里。</p></div>
+      <section class="context-settings" id="context-settings" aria-label="会话上下文预算" hidden>
+        <p id="effective-budget"></p>
+        <p id="effective-thresholds"></p>
+        <div class="context-startup" id="context-startup" hidden>
+          <p id="startup-budget"></p>
+          <button type="button" class="quiet" id="apply-context">应用当前启动配置</button>
+        </div>
+        <p id="context-feedback" role="status" hidden></p>
+      </section>
+      <div class="panel-body" id="context" hidden><p class="empty">模型请求的预算和实际用量会显示在这里。</p></div>
+      <div class="session-meta"><span id="model">未选择模型</span><span id="calls">0 次调用</span></div>
+    </aside>
+  </main>
+</body>
+</html>

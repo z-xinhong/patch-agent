@@ -4,10 +4,12 @@ import platform
 import shlex
 import subprocess
 import uuid
+from threading import Event
 from typing import Any
 
 from pydantic import BaseModel
 
+from minisweagent.environments.local import CommandCancelled, _run
 from minisweagent.exceptions import Submitted
 from minisweagent.utils.serialize import recursive_merge
 
@@ -98,10 +100,17 @@ class DockerEnvironment:
         self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
         self.container_id = result.stdout.strip()
 
-    def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
+    def execute(
+        self, action: dict, cwd: str = "", *,
+        timeout: int | None = None, check_submission: bool = True, cancel_event: Event | None = None,
+    ) -> dict[str, Any]:
         """Execute a command in the Docker container and return the result as a dict."""
         command = action.get("command", "")
         cwd = cwd or self.config.cwd
+        if cancel_event is not None and cancel_event.is_set():
+            return {"output": "", "returncode": -1, "exception_info": "Command cancelled."}
+        if self.container_id is None and cancel_event is not None:
+            self._start_container()
         assert self.container_id, "Container not started"
 
         cmd = [self.config.executable, "exec", "-w", cwd]
@@ -113,17 +122,15 @@ class DockerEnvironment:
         cmd.extend([self.container_id, *self.config.interpreter, command])
 
         try:
-            result = subprocess.run(
-                cmd,
-                text=True,
-                timeout=timeout or self.config.timeout,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
+            result = _run(cmd, None, None, timeout or self.config.timeout, cancel_event)
             output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
         except Exception as e:
+            if isinstance(e, CommandCancelled):
+                subprocess.run(
+                    [self.config.executable, "rm", "-f", self.container_id],
+                    check=True, timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                self.container_id = None
             raw_output = getattr(e, "output", None)
             raw_output = (
                 raw_output.decode("utf-8", errors="replace") if isinstance(raw_output, bytes) else (raw_output or "")
@@ -134,7 +141,8 @@ class DockerEnvironment:
                 "exception_info": f"An error occurred while executing the command: {e}",
                 "extra": {"exception_type": type(e).__name__, "exception": str(e)},
             }
-        self._check_finished(output)
+        if check_submission:
+            self._check_finished(output)
         return output
 
     def _check_finished(self, output: dict):

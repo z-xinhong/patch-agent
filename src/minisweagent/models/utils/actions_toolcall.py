@@ -28,7 +28,8 @@ BASH_TOOL = {
 
 
 def parse_toolcall_actions(
-    tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None
+    tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None,
+    extra_tools: tuple[str, ...] = (),
 ) -> list[dict]:
     """Parse tool calls from the response. Raises FormatError if unknown tool or invalid args.
 
@@ -58,10 +59,13 @@ def parse_toolcall_actions(
             args = json.loads(tool_call.function.arguments)
         except Exception as e:
             error_msg = f"Error parsing tool call arguments: {e}."
-        if tool_call.function.name != "bash":
-            error_msg += f"Unknown tool '{tool_call.function.name}'."
-        if not isinstance(args, dict) or "command" not in args:
+        name = tool_call.function.name
+        if name not in ("bash", *extra_tools):
+            error_msg += f"Unknown tool '{name}'."
+        if name == "bash" and (not isinstance(args, dict) or not isinstance(args.get("command"), str)):
             error_msg += "Missing 'command' argument in bash tool call."
+        if name in extra_tools and not isinstance(args, dict):
+            error_msg += "Tool arguments must be a JSON object."
         if error_msg:
             raise FormatError(
                 {
@@ -72,7 +76,8 @@ def parse_toolcall_actions(
                     "extra": {"interrupt_type": "FormatError"},
                 }
             )
-        actions.append({"command": args["command"], "tool_call_id": tool_call.id})
+        action = {"command": args["command"]} if name == "bash" else {"tool": name, "arguments": args}
+        actions.append(action | {"tool_call_id": tool_call.id})
     return actions
 
 

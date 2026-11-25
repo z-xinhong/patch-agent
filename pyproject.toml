@@ -38,6 +38,7 @@ dependencies = [
     "litellm >= 1.75.5, != 1.82.7, != 1.82.8", # Security: Skip compromised 1.82.7/8; requires 1.75.5+ for GPT-5
     "tenacity",
     "rich",
+    "markdown-it-py>=2.2",
     "python-dotenv",
     "typer",
     "platformdirs",
@@ -103,7 +104,7 @@ where = ["src"]
 include = ["minisweagent*"]
 
 [tool.setuptools.package-data]
-minisweagent = ["config/**/*"]
+minisweagent = ["config/**/*", "run/utilities/workbench_assets/*"]
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.

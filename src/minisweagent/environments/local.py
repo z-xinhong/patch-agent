@@ -2,6 +2,8 @@ import os
 import platform
 import signal
 import subprocess
+import time
+from threading import Event
 from typing import Any
 
 from pydantic import BaseModel
@@ -21,12 +23,15 @@ class LocalEnvironment:
         """This class executes bash commands directly on the local machine."""
         self.config = config_class(**kwargs)
 
-    def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
+    def execute(
+        self, action: dict, cwd: str = "", *,
+        timeout: int | None = None, check_submission: bool = True, cancel_event: Event | None = None,
+    ) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
         command = action.get("command", "")
         cwd = cwd or self.config.cwd or os.getcwd()
         try:
-            result = _run(command, cwd, os.environ | self.config.env, timeout or self.config.timeout)
+            result = _run(command, cwd, os.environ | self.config.env, timeout or self.config.timeout, cancel_event)
             output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
         except Exception as e:
             raw_output = getattr(e, "output", None)
@@ -39,7 +44,8 @@ class LocalEnvironment:
                 "exception_info": f"An error occurred while executing the command: {e}",
                 "extra": {"exception_type": type(e).__name__, "exception": str(e)},
             }
-        self._check_finished(output)
+        if check_submission:
+            self._check_finished(output)
         return output
 
     def _check_finished(self, output: dict):
@@ -69,11 +75,25 @@ class LocalEnvironment:
         }
 
 
-def _run(command: str, cwd: str, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
-    """Like subprocess.run, but kills the whole process group on timeout so no children are orphaned."""
+class CommandCancelled(subprocess.SubprocessError):
+    def __init__(self, output: str):
+        self.output = output
+        super().__init__("Command cancelled.")
+
+
+def _run(
+    command: str | list[str],
+    cwd: str | None,
+    env: dict[str, str] | None,
+    timeout: int,
+    cancel_event: Event | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Collect combined output and kill the command group on timeout or cancellation."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise CommandCancelled("")
     process = subprocess.Popen(
         command,
-        shell=True,
+        shell=isinstance(command, str),
         text=True,
         cwd=cwd,
         env=env,
@@ -84,9 +104,27 @@ def _run(command: str, cwd: str, env: dict[str, str], timeout: int) -> subproces
         start_new_session=os.name == "posix",
     )
     try:
-        stdout, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL) if os.name == "posix" else process.kill()
+        if cancel_event is None:
+            stdout, _ = process.communicate(timeout=timeout)
+        else:
+            deadline = time.monotonic() + timeout
+            while not cancel_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, _ = process.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            else:
+                raise CommandCancelled("")
+    except (CommandCancelled, subprocess.TimeoutExpired) as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL) if os.name == "posix" else process.kill()
+        except ProcessLookupError:
+            pass
         stdout, _ = process.communicate()
-        raise subprocess.TimeoutExpired(command, timeout, output=stdout)
+        exc.output = stdout
+        raise
     return subprocess.CompletedProcess(command, process.returncode, stdout=stdout)
