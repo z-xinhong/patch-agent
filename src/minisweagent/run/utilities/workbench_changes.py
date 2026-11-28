@@ -12,13 +12,33 @@ _MAX_TOTAL_BYTES = 8_000_000
 _IGNORED_DIRS = {".git", ".venv", ".idea", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__", "node_modules"}
 
 
+def workspace_identity(root: Path) -> dict:
+    stat = root.stat()
+    identity = {"directory": [stat.st_dev, stat.st_ino]}
+    if not (git := which("git")):
+        return identity
+
+    def git_value(*args: str) -> str | None:
+        result = run([git, *args], cwd=root, capture_output=True, text=True, errors="replace")
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    if git_dir := git_value("rev-parse", "--absolute-git-dir"):
+        directory = Path(git_dir).resolve()
+        if directory.is_dir():
+            git_stat = directory.stat()
+            identity["git_directory"] = [str(directory), git_stat.st_dev, git_stat.st_ino]
+        identity["branch"] = git_value("symbolic-ref", "--quiet", "HEAD")
+        identity["revision"] = git_value("rev-parse", "--verify", "HEAD")
+    return identity
+
+
 @dataclass
 class WorkspaceSnapshot:
     files: dict[str, tuple[str, str | None]]
     limited: bool = False
 
     @classmethod
-    def capture(cls, root: Path) -> "WorkspaceSnapshot":
+    def capture(cls, root: Path, *, contents: bool = True) -> "WorkspaceSnapshot":
         snapshot = cls({})
         total = 0
         for path in _workspace_files(root):
@@ -29,6 +49,11 @@ class WorkspaceSnapshot:
                 if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root):
                     continue
                 stat = path.stat()
+                if not contents:
+                    snapshot.files[path.relative_to(root).as_posix()] = (
+                        f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}", None,
+                    )
+                    continue
                 if stat.st_size > _MAX_FILE_BYTES or total + stat.st_size > _MAX_TOTAL_BYTES:
                     snapshot.files[path.relative_to(root).as_posix()] = (
                         f"{stat.st_size}:{stat.st_mtime_ns}", None

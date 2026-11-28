@@ -160,17 +160,18 @@ function commandCard(event) {
   heading.append(node("strong", passed ? "exit-ok" : "exit-fail", `[${event.returncode}] `));
   heading.append(document.createTextNode(event.command.replaceAll("\n", " ")));
   card.append(heading, node("pre", "", [
-    event.command, event.text || "（无输出）", event.error, event.truncated ? "（输出预览已截断）" : "",
+    event.recall_heading || event.command, event.text || "（无输出）", event.error, event.truncated ? "（输出预览已截断）" : "",
   ].filter(Boolean).join("\n\n")));
-  if (event.evidence) {
+  const evidence = event.recalled || event.evidence;
+  if (evidence) {
     const session = active;
     const form = node("form", "evidence-form");
     const field = node("input");
     field.type = "number";
     field.min = "1";
-    field.value = "1";
+    field.value = String(event.start_line ?? 1);
     field.setAttribute("aria-label", "起始行");
-    const button = node("button", "quiet", "回读 " + event.evidence);
+    const button = node("button", "quiet", "回读 " + evidence);
     button.type = "submit";
     const raw = node("pre");
     raw.hidden = true;
@@ -178,7 +179,7 @@ function commandCard(event) {
     form.addEventListener("submit", async (eventObject) => {
       eventObject.preventDefault();
       try {
-        const result = await api(`/${session.id}/evidence/${event.evidence}?start=${Number(field.value)}`);
+        const result = await api(`/${session.id}/evidence/${evidence}?start=${Number(field.value)}`);
         raw.textContent = result.output || "（没有更多行）";
       } catch (error) {
         raw.textContent = error.message;
@@ -206,9 +207,10 @@ function showResume(resume) {
   if (!resume) return;
   element("resume-goal").textContent = `上次需求 · ${resume.goal}`;
   const action = resume.action;
-  element("resume-action").textContent = action
+  const actionText = action
     ? `${actionLabels[action.state]} · ${action.command}`
     : "这次旧记录没有可确认的单条执行状态。";
+  element("resume-action").textContent = [actionText, ...(resume.warnings || [])].join(" · ");
 }
 
 function showVerification(check, backend) {
@@ -245,11 +247,16 @@ function showVerification(check, backend) {
 const tokenLabels = {
   task: "任务", project_rules: "项目规则", instructions: "系统指令",
   history: "对话历史", observations: "工具观察", tools: "工具定义", summary: "旧任务摘要",
+  background: "稳定背景", working_memory: "任务状态", relevant_memory: "相关旧记忆", current_request: "当前请求",
 };
 
 function appendContext(event) {
   const session = active;
   const number = (value) => Number.isInteger(value) ? value.toLocaleString() : "未提供";
+  if (event.kind === "evidence_search") {
+    contextPanel.append(node("p", "context-line", `搜索证据 ${event.query} · ${event.hits} 条结果`));
+    return;
+  }
   if (event.kind === "recall") {
     session.recalls = (session.recalls || 0) + 1;
     contextPanel.append(node("p", "context-line", `回读 ${event.evidence} · ${event.characters} 字符`));
@@ -296,7 +303,10 @@ function appendContext(event) {
   const card = node("details");
   card.dataset.request = event.request;
   card.append(node("summary", "", `请求 ${event.request} · ${number(event.estimated)} / ${number(event.limit)}`));
-  const categories = Object.entries(event.categories).map(([key, value]) => `${tokenLabels[key]} ${number(value)}`);
+  const categories = Object.entries(event.categories).map(([key, value]) => {
+    const budget = event.section_budgets?.[key];
+    return `${tokenLabels[key]} ${number(value)}${Number.isInteger(budget) ? ` / ${number(budget)}` : ""}`;
+  });
   card.append(node("p", "context-line", categories.join(" · ")));
   card.append(node("p", "context-line",
     `压缩前估算 ${number(event.before)} · 输出预留 ${number(event.output_reserve)} · 缩短 ${event.shortened.length} 条 · 移出 ${event.removed.length} 条`));
@@ -328,7 +338,7 @@ function setContextTotals(text) {
 }
 
 function appendEvent(event) {
-  if (["context", "usage", "recall", "summary"].includes(event.kind)) {
+  if (["context", "usage", "recall", "summary", "evidence_search"].includes(event.kind)) {
     appendContext(event);
     return;
   }

@@ -3,9 +3,10 @@
 import json
 import logging
 import mimetypes
-import shutil
 import shlex
+import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,12 +25,13 @@ from minisweagent.exceptions import Submitted
 from minisweagent.models import get_model, get_model_class, get_model_name
 from minisweagent.models.litellm_model import LitellmModel
 from minisweagent.models.utils.content_string import get_content_string
-from minisweagent.run.utilities.workbench_changes import WorkspaceSnapshot
+from minisweagent.run.utilities.workbench_changes import WorkspaceSnapshot, workspace_identity
 from minisweagent.run.utilities.workbench_context import (
     ContextBudget,
     ContextBudgetExceeded,
     ContextConfig,
     WorkbenchModel,
+    recall_heading,
     write_json,
 )
 from minisweagent.run.utilities.workbench_lifecycle import TurnCancelled, WorkspaceCommands, check_cancelled
@@ -45,8 +47,23 @@ _COMPLETION_RULE = (
     "text without tools. You do not need to run a submission command. This completion rule takes precedence "
     "over the workflow's tool call and submission instructions."
 )
+_VERIFY_ARCHIVED_CONTRACT = (
+    "Before editing code that depends on an earlier compatibility contract, verify the required "
+    "behavior, inputs, and edge cases against evidence. Search or recall any missing fact."
+)
+_MINI_WORKFLOW = (
+    "For changes, locate the relevant code, reproduce the issue, edit narrowly, "
+    "and verify with targeted tests. Shell state resets between commands."
+)
+_SWEBENCH_WORKFLOW = (
+    "Fix the issue in workspace source files. Preserve tests and configuration. "
+    "Reproduce the bug and run targeted tests. Inspect the final source diff. Shell state resets between commands."
+)
 _LOGGER = logging.getLogger(__name__)
 _MARKDOWN = MarkdownIt("commonmark", {"html": False}).enable(["table", "strikethrough"]).disable("image")
+_ARCHIVE_TOOLS = {"recall_output", "search_evidence"}
+_CHECKPOINT_SCHEMA = 1
+_TRAJECTORY_FORMAT = "mini-swe-agent-1.1"
 _INTERRUPTED = (
     "The last run was interrupted. Its pending or running commands may not have completed. "
     "Do not assume their effects or replay them automatically. Inspect the current workspace before continuing."
@@ -58,6 +75,7 @@ class ToolAction:
     label: str
     purpose: str = "command"
     id: str = field(default_factory=lambda: uuid4().hex)
+    tool: str = "bash"
 
 
 def render_event(event: dict) -> dict:
@@ -75,6 +93,21 @@ def _read_json(path: Path, default: dict) -> dict:
 
 def _storage_dir(config: dict) -> Path:
     return Path(config.get("workbench", {}).get("storage_dir", global_config_dir / "workbench")).expanduser().resolve()
+
+
+def _partial_success_notice(change: dict) -> str:
+    paths = ", ".join(f"{item['status']} {item['path'][:80]!r}" for item in change["files"][:4])
+    remainder = " and possibly other files" if change["limited"] or len(change["files"]) > 4 else ""
+    return (
+        f"Command failed with exit code {change['returncode']}. Workspace changes include {paths}{remainder}. "
+        "Inspect the current files and diff before retrying."
+    )
+
+
+def get_workbench_config(specs: list[str]) -> dict:
+    return recursive_merge(*(get_config_from_spec(spec) for spec in [
+        builtin_config_dir / "mini.yaml", "agent.step_limit=30", *specs,
+    ]))
 
 
 def _read_events(directory: Path) -> list[dict]:
@@ -115,6 +148,7 @@ class WorkbenchAgent(DefaultAgent):
         if isinstance(model, WorkbenchModel):
             model.context = ContextBudget(session.config.context, session.directory, session.emit)
             model.context.check_source = session.source_status
+            model.context.verification = session.current_verification
             model.summarize_tasks = self.summarize_tasks
             model.cancel_event = session.cancel_event
         super().__init__(model, session.workspace.env, **(agent_config | {"output_path": None}))
@@ -170,12 +204,28 @@ class WorkbenchAgent(DefaultAgent):
             root = "/workspace" if self.session.config.backend == "docker" else str(self.session.root)
             scope = f"Workspace root: {root}. Keep actions in this workspace."
             if isinstance(self.model, WorkbenchModel):
-                scope += " Use read_file for source evidence and apply_patch for exact tracked edits when practical."
-                scope += " When recall_output is available, use it to retrieve archived observations by evidence ID."
-                workflow = Template(self.config.instance_template, undefined=StrictUndefined).render(
+                context = self.model.context.config
+                workflow = self.config.instance_template
+                workflow_heading = "For code changes, use this workflow where relevant:\n"
+                if context.compact_prompt:
+                    for config_path, compact in (
+                        ("mini.yaml", _MINI_WORKFLOW), ("benchmarks/swebench.yaml", _SWEBENCH_WORKFLOW),
+                    ):
+                        standard = get_config_from_spec(builtin_config_dir / config_path)["agent"]["instance_template"]
+                        if workflow in (standard, standard.replace("/testbed", "/workspace")):
+                            workflow = compact
+                            workflow_heading = ""
+                            break
+                    scope += " Prefer read_file and apply_patch for exact edits."
+                else:
+                    scope += " Use read_file for source evidence and apply_patch for exact tracked edits when practical."
+                    scope += " When recall_output is available, use it to retrieve archived observations by evidence ID."
+                    scope += " When search_evidence is available, search by path or keywords if you lack the evidence ID."
+                scope += " " + _VERIFY_ARCHIVED_CONTRACT
+                workflow = Template(workflow, undefined=StrictUndefined).render(
                     **self.get_template_vars(task="Follow the user task below.")
                 )
-                scope += f"\n\n{_COMPLETION_RULE}\n\nFor code changes, use this workflow where relevant:\n{workflow}"
+                scope += f"\n\n{_COMPLETION_RULE}\n\n{workflow_heading}{workflow}"
                 task = self.model.format_message(role="user", content=self.extra_template_vars["task"])
             system = self.model.format_message(
                 role="system", content=f"{get_content_string(system)}\n\n{scope}"
@@ -214,20 +264,59 @@ class WorkbenchAgent(DefaultAgent):
             return action["command"]
         return f'{action["tool"]} {json.dumps(action["arguments"], ensure_ascii=False)}'
 
+    def search_evidence(self, query: str, limit: int = 5) -> dict:
+        started = time.monotonic()
+        hits = self.session.evidence.search(query, limit, cancel_event=self.session.cancel_event, with_context=True)
+        lines = []
+        sources = []
+        excerpts = []
+        for hit in hits:
+            evidence = hit["id"]
+            label = " ".join(hit["label"].split())[:160]
+            location = f" · archived line {hit['line']}" if hit["line"] is not None else ""
+            preview = hit["preview"]
+            current = True
+            if source := self.session.source_status(evidence):
+                status = f"source {source['status']}"
+                current = source["status"] == "current"
+                if not current:
+                    preview = f"Use read_file for the current content of {source['path'][:160]}."
+                elif preview:
+                    sources.append(evidence)
+            else:
+                status = "historical output"
+            if preview and current:
+                excerpts.append({"id": evidence, "line": hit["line"], "text": preview})
+            snippet = f" · {preview}" if preview else ""
+            lines.append(f"{evidence} · {label}{location} · {status}{snippet}")
+            if current and (following := hit.get("following")):
+                number = hit["line"] + 1
+                lines.append(f"{evidence} · archived line {number} · {following}")
+                excerpts.append({"id": evidence, "line": number, "text": following})
+        self.session.emit(
+            "evidence_search", query=query, hits=len(hits), elapsed_ms=round((time.monotonic() - started) * 1000, 2),
+        )
+        return {
+            "output": "\n".join(lines) or "No matching evidence in this session.",
+            "extra": {"search_sources": sources, "evidence_excerpts": excerpts},
+        }
+
     def execute_action(self, action: dict, recorded: ToolAction) -> dict:
         if "command" in action:
             with self.session.commands.acquire(self.session.root, self.session.cancel_event):
-                self.session.record_action(recorded, "started")
-                return self.env.execute(action, cancel_event=self.session.cancel_event)
+                return self.session.run_workspace_command(
+                    recorded, lambda: self.env.execute(action, cancel_event=self.session.cancel_event),
+                )
         tool, arguments = action["tool"], action["arguments"]
         handlers = {
             "read_file": self.session.workspace.read_file,
             "apply_patch": self.session.workspace.apply_patch,
             "recall_output": self.session.evidence.recall,
+            "search_evidence": self.search_evidence,
         }
         started = time.monotonic()
         try:
-            if tool != "recall_output":
+            if tool not in _ARCHIVE_TOOLS:
                 with self.session.commands.acquire(self.session.root, self.session.cancel_event):
                     self.session.record_action(recorded, "started")
                     result = handlers[tool](**arguments)
@@ -240,11 +329,13 @@ class WorkbenchAgent(DefaultAgent):
         if tool == "recall_output":
             evidence = result["extra"]["recalled"]
             if (source := self.session.source_status(evidence)) and source["status"] != "current":
-                result["output"] = (
+                warning = (
                     f"Historical snapshot of {source['path']} ({evidence}); "
                     f"the current file is {source['status']}. Use read_file for the current content.\n"
-                    + result["output"]
                 )
+                result["extra"]["source_warning"] = warning
+                result["extra"]["recalled_end_line"] = None
+                result["output"] = warning.rstrip()
             self.session.emit(
                 "recall", evidence=evidence, characters=len(result["output"]),
                 estimated_tokens=ContextBudget.rough(result["output"]),
@@ -267,8 +358,8 @@ class WorkbenchAgent(DefaultAgent):
                     return self.add_messages(self.model.format_message(role="user", content=result["output"]))
                 raise terminal
             raise completed
-        records = [ToolAction(self.action_label(action)) for action in actions]
-        read_only = {"read_file", "recall_output"}
+        records = [ToolAction(self.action_label(action), tool=action.get("tool", "bash")) for action in actions]
+        read_only = {"read_file", *_ARCHIVE_TOOLS}
         gated = [record for action, record in zip(actions, records) if action.get("tool") not in read_only]
         outputs = []
         try:
@@ -309,9 +400,10 @@ class WorkbenchAgent(DefaultAgent):
         last = self.messages[-1] if self.messages else {}
         result = last.get("extra", {}) if last.get("role") == "exit" else {}
         trajectory = {
-            "trajectory_format": "mini-swe-agent-1.1", "messages": self.messages,
+            "trajectory_format": _TRAJECTORY_FORMAT, "messages": self.messages,
             "info": {
                 "workspace": str(self.session.root), "model": self.session.model_name,
+                "workspace_identity": self.session.saved_workspace_identity,
                 "model_stats": {
                     "api_calls": self.session.calls + self.n_calls,
                     "instance_cost": self.session.cost + self.cost,
@@ -338,6 +430,10 @@ class Session:
         self.pending: dict | None = None
         self.decision: bool | None = None
         self.resume_notice = ""
+        recovery = metadata.get("checkpoint_recovery")
+        self.checkpoint_recovery = recovery if isinstance(recovery, str) else ""
+        identity = metadata.get("workspace_identity")
+        self.saved_workspace_identity: dict | None = identity if isinstance(identity, dict) else None
         self.directory = archive if archive is not None else _storage_dir(config) / self.id
         if self.directory.is_relative_to(root):
             raise ValueError("Workbench storage must be outside the workspace.")
@@ -384,28 +480,62 @@ class Session:
         self.agent: WorkbenchAgent | None = None
         if archive is None:
             self._initialize()
+            self.saved_workspace_identity = workspace_identity(self.root)
             self.save_metadata()
 
     @classmethod
     def restore(cls, directory: Path, config: dict) -> "Session | None":
-        metadata = _read_json(directory / "session.json", {})
-        if not metadata:
-            info = _read_json(directory / "trajectory.json", {}).get("info", {})
-            if not info.get("workspace"):
+        recovery = ""
+        try:
+            metadata = _read_json(directory / "session.json", {})
+        except json.JSONDecodeError:
+            metadata = {}
+            recovery = "The session checkpoint was unreadable."
+        if not isinstance(metadata, dict):
+            metadata = {}
+            recovery = "The session checkpoint had an invalid structure."
+        version = metadata.get("schema_version", _CHECKPOINT_SCHEMA)
+        if type(version) is not int or version != _CHECKPOINT_SCHEMA:
+            recovery = "The session checkpoint uses an unsupported schema version."
+        if not metadata or recovery:
+            try:
+                trajectory = _read_json(directory / "trajectory.json", {})
+            except json.JSONDecodeError:
+                trajectory = {}
+            if not isinstance(trajectory, dict):
+                trajectory = {}
+            info = trajectory.get("info")
+            if not isinstance(info, dict) or not isinstance(info.get("workspace"), str) or not info["workspace"] or (
+                not isinstance(trajectory.get("messages"), list)
+            ) or (
+                recovery and trajectory.get("trajectory_format") != _TRAJECTORY_FORMAT
+            ):
+                if recovery:
+                    raise ValueError(f"{recovery} No compatible trajectory is available.")
                 return None
             events = _read_events(directory)
             status = "ready" if events and events[-1]["kind"] == "finish" else "interrupted"
-            metadata = {"workspace": info["workspace"], "status": status}
+            metadata = {
+                "workspace": info["workspace"], "status": "interrupted" if recovery else status,
+                "workspace_identity": info.get("workspace_identity"),
+            }
             if model := info.get("model"):
                 metadata["model"] = {"model_name": model}
         root = Path(metadata["workspace"]).expanduser()
         if not root.is_absolute():
             raise ValueError("Persisted workspace must use an absolute path.")
-        return cls(root, config, archive=directory, metadata=metadata)
+        session = cls(root, config, archive=directory, metadata=metadata)
+        if recovery:
+            session.checkpoint_recovery = f"{recovery} Rebuilt from the saved trajectory. Review the workspace and pending actions."
+        return session
 
     @property
     def workspace_available(self) -> bool:
         return self.root.is_dir() and self.root.resolve() == self.root
+
+    def cleanup(self) -> None:
+        if self.config.backend == "docker" and self.workspace is not None:
+            self.workspace.env.cleanup()
 
     @property
     def title(self) -> str:
@@ -414,8 +544,8 @@ class Session:
 
     @property
     def strategy(self) -> str | None:
-        if self.model_class in {f"{LitellmModel.__module__}.{LitellmModel.__name__}",
-                                f"{WorkbenchModel.__module__}.{WorkbenchModel.__name__}"}:
+        model_class = get_model_class(self.model_name, self.model_class)
+        if model_class is LitellmModel or issubclass(model_class, WorkbenchModel):
             return self.config.context.strategy
         return None
 
@@ -428,6 +558,9 @@ class Session:
 
     def save_metadata(self, *, context: ContextConfig | None = None, context_since: int | None = None) -> None:
         write_json(self.directory / "session.json", self.listing() | {
+            "schema_version": _CHECKPOINT_SCHEMA,
+            "workspace_identity": self.saved_workspace_identity,
+            "checkpoint_recovery": self.checkpoint_recovery,
             "created_at": self.created_at,
             "context_since": self.context_since if context_since is None else context_since,
             "model": {"model_class": self.model_class, "model_name": self.model_name},
@@ -494,6 +627,7 @@ class Session:
                 stream.write(json.dumps(event, ensure_ascii=True) + "\n")
             self.events.append(event)
             self._track_action(event)
+            self.condition.notify_all()
 
     def _track_action(self, event: dict) -> None:
         if event["kind"] == "user":
@@ -505,6 +639,25 @@ class Session:
 
     def record_action(self, action: ToolAction, state: str) -> None:
         self.emit("action_state", action_id=action.id, command=action.label, purpose=action.purpose, state=state)
+
+    def run_workspace_command(self, action: ToolAction, execute: Callable[[], dict]) -> dict:
+        before = WorkspaceSnapshot.capture(self.root, contents=False)
+        self.record_action(action, "started")
+        output = execute()
+        if output["returncode"] != 0:
+            after = WorkspaceSnapshot.capture(self.root, contents=False)
+            changes = [
+                {"path": change["path"], "status": change["status"]}
+                for change in before.changes(after)
+                if (change["status"] != "added" or not before.limited)
+                and (change["status"] != "deleted" or not after.limited)
+            ]
+            if changes:
+                output = output | {"extra": output.get("extra", {}) | {"partial_success": {
+                    "returncode": output["returncode"], "files": changes[:12],
+                    "limited": before.limited or after.limited or len(changes) > 12,
+                }}}
+        return output
 
     def source_status(self, id: str) -> dict | None:
         if source := self.evidence.source(id):
@@ -531,7 +684,16 @@ class Session:
         action = next(iter(attention or outstanding or actions), None)
         if action is not None:
             action = {key: action[key] for key in ("action_id", "command", "purpose", "state", "evidence") if key in action}
-        return {"goal": self.last_goal, "action": action}
+        details = {"goal": self.last_goal, "action": action}
+        warnings = [*self.partial_success_notices(), *([self.checkpoint_recovery] if self.checkpoint_recovery else [])]
+        if warnings:
+            details["warnings"] = warnings
+        return details
+
+    def partial_success_notices(self) -> list[str]:
+        changes = [event["partial_success"] for event in reversed(self.action_progress.values())
+                   if "partial_success" in event]
+        return [_partial_success_notice(change) for change in changes[:3]]
 
     def record_output(self, action: ToolAction, output: dict, *, state: str | None = None) -> dict:
         if state is None:
@@ -541,19 +703,45 @@ class Session:
                 state = "completed" if output["returncode"] == 0 else "failed"
         evidence = self.evidence.save(action.label, output)
         text = output["output"]
-        extra = output.get("extra", {}) | {"evidence_id": evidence, "label": action.label, "action_id": action.id}
-        self.emit("tool", action_id=action.id, purpose=action.purpose, state=state, command=action.label,
-                  text=text[:24_000], truncated=len(text) > 24_000,
-                  returncode=output["returncode"], error=output.get("exception_info", ""), evidence=evidence)
+        extra = output.get("extra", {}) | {
+            "evidence_id": evidence, "label": action.label, "action_id": action.id,
+            "tool_name": action.tool, "purpose": action.purpose, "action_state": state,
+        }
+        event_fields = {}
+        if id := extra.get("recalled"):
+            event_fields = {"recalled": id, "start_line": extra["start_line"], "recall_heading": recall_heading(extra)}
         source = f"\nSHA-256: {extra['sha256']}" if extra.get("sha256") else ""
-        return output | {"output": f"Evidence {evidence}{source}\n{text}", "extra": extra}
+        heading = event_fields.get("recall_heading") or (
+            "Recall failed." if action.tool == "recall_output" else f"Evidence {evidence}{source}"
+        )
+        if change := extra.get("partial_success"):
+            heading += "\n" + _partial_success_notice(change)
+            event_fields["partial_success"] = change
+        shown, error = f"{heading}\n{text}", output.get("exception_info") or ""
+        context = self.config.context
+        if self.strategy == "evidence" and context.limit_tool_output:
+            shown, limited_error = ContextBudget.limit_output(
+                heading, text, error, context.tool_output_tokens, extra, task=self.last_goal,
+            )
+            if shown != f"{heading}\n{text}" or limited_error != error:
+                extra["output_limited"] = True
+            error = limited_error
+        if "file_lines" in extra and not extra.get("output_limited"):
+            if extra["end_line"] < extra["file_lines"]:
+                shown += f"\nNext file line: {extra['end_line'] + 1}."
+        self.emit("tool", action_id=action.id, purpose=action.purpose, state=state, command=action.label,
+                  text=text[:24_000], truncated=len(text) > 24_000, output_limited=extra.get("output_limited", False),
+                  returncode=output["returncode"], error=output.get("exception_info", ""), evidence=evidence, **event_fields)
+        return output | {"output": shown, "exception_info": error, "extra": extra}
 
     def confirm(self, actions: list[ToolAction]) -> bool:
         with self.condition:
             check_cancelled(self.cancel_event)
             commands = [action.label for action in actions]
             purpose = actions[0].purpose
-            self.pending = {"id": uuid4().hex, "commands": commands, "purpose": purpose}
+            self.pending = {
+                "id": uuid4().hex, "commands": commands, "tools": [action.tool for action in actions], "purpose": purpose,
+            }
             for action in actions:
                 self.record_action(action, "awaiting_approval")
             self.emit("command_pending", commands=commands, purpose=purpose)
@@ -596,7 +784,8 @@ class Session:
             if not self.workspace_available:
                 raise ValueError(f"工作区目录不可用：{self.root}")
             self._initialize()
-            if self.status in {"interrupted", "cancelled"}:
+            self.resume_notice = ""
+            if self.status in {"interrupted", "cancelled", "error"}:
                 self.resume_notice = _INTERRUPTED
                 details = self.resume_details()
                 if details and (action := details["action"]):
@@ -612,6 +801,7 @@ class Session:
                 ), None)
                 if recent_request.get("kind") == "user" and recent_request["text"] != last_task:
                     self.resume_notice += " The interrupted user request was: " + recent_request["text"]
+            self.resume_notice = " ".join(filter(None, [self.resume_notice, *self.partial_success_notices()]))
             self.verification_attempts = 0
             self.agent.n_calls = 0
             self.agent.cost = 0.0
@@ -629,16 +819,19 @@ class Session:
     def _run(self, task: str) -> None:
         status = "error"
         try:
-            if self.workspace.checks.verify:
-                with self.commands.acquire(self.root, self.cancel_event):
-                    self.turn_version = self.workspace.version()
-            else:
-                self.turn_version = None
+            with self.commands.acquire(self.root, self.cancel_event):
+                identity = workspace_identity(self.root)
+                self.turn_version = self.workspace.version() if self.workspace.checks.verify else None
+            self.check_recovery(identity)
             result = self.preflight() or self.agent.run_turn(task)
             if result["exit_status"] == "PreflightFailed":
                 write_json(self.directory / "preflight.json", result)
             write_json(self.directory / "changes.json", self.changes_payload())
             self.settle_actions(cancelled=result["exit_status"] == "Cancelled")
+            if result["exit_status"] == "Submitted" and (self.saved_workspace_identity != identity or self.checkpoint_recovery):
+                self.saved_workspace_identity = identity
+                self.checkpoint_recovery = ""
+                self.agent.save(None)
             self.emit("finish", reason=result.get("exit_status", ""),
                       text="" if result.get("answered") else result.get("submission", ""))
             status = "cancelled" if result.get("exit_status") == "Cancelled" else "ready"
@@ -658,7 +851,31 @@ class Session:
                 self.cost += self.agent.cost
                 self.status = status
                 self.updated_at = time.time()
+                self.condition.notify_all()
                 self.save_metadata()
+
+    def check_recovery(self, identity: dict) -> None:
+        notices = [self.resume_notice]
+        if self.checkpoint_recovery:
+            self.emit("restore_fallback", text=self.checkpoint_recovery)
+            notices.append(self.checkpoint_recovery)
+        before = self.saved_workspace_identity
+        if before is not None and before != identity:
+            changed = [key for key in sorted(before.keys() | identity.keys()) if before.get(key) != identity.get(key)]
+            message = (
+                f"Workspace drift detected in {', '.join(changed)}. "
+                "Recheck the current repository, project instructions, and relevant files before making changes."
+            )
+            self.emit("workspace_drift", fields=changed, text=message)
+            notices.append(message)
+            if self.verification["status"] == "passed":
+                self.verification = self.verification | {"status": "stale"}
+                write_json(self.directory / "verification.json", self.verification)
+        if before is None:
+            self.saved_workspace_identity = identity
+        self.resume_notice = "\n".join(filter(None, notices))
+        if self.resume_notice:
+            self.emit("notice", text=self.resume_notice)
 
     def preflight(self) -> dict | None:
         argv = self.workspace.checks.dependency_check()
@@ -669,8 +886,7 @@ class Session:
         if not self.confirm([action]):
             return {"exit_status": "PreflightFailed", "submission": "已拒绝环境预检。"}
         with self.commands.acquire(self.root, self.cancel_event):
-            self.record_action(action, "started")
-            result = self.workspace.check(argv, self.cancel_event)
+            result = self.run_workspace_command(action, lambda: self.workspace.check(argv, self.cancel_event))
         self.record_output(action, result)
         check_cancelled(self.cancel_event)
         if result["returncode"] != 0:
@@ -694,8 +910,7 @@ class Session:
         if self.confirm([action]):
             with self.commands.acquire(self.root, self.cancel_event):
                 before = self.workspace.version()
-                self.record_action(action, "started")
-                result = self.workspace.check(argv, self.cancel_event)
+                result = self.run_workspace_command(action, lambda: self.workspace.check(argv, self.cancel_event))
                 version = self.workspace.version()
             status = "stale" if before != version else "passed" if result["returncode"] == 0 else "failed"
         else:
@@ -804,8 +1019,7 @@ class WorkbenchServer(ThreadingHTTPServer):
             removed = session.directory.with_name(f".deleted-{session.id}-{uuid4().hex}")
             session.directory.rename(removed)
             del self.sessions[session.id]
-        if session.config.backend == "docker" and session.workspace is not None:
-            session.workspace.env.cleanup()
+        session.cleanup()
         shutil.rmtree(removed)
 
 
@@ -944,8 +1158,7 @@ def main(
     port: int = typer.Option(8765, "--port", min=0, max=65535),
 ) -> None:
     """Start a local web interface for mini-SWE-agent."""
-    specs = [builtin_config_dir / "mini.yaml", "agent.step_limit=30", *config_spec]
-    config = recursive_merge(*(get_config_from_spec(spec) for spec in specs))
+    config = get_workbench_config(config_spec)
     get_model_name(config=config.get("model", {}))
     context = ContextConfig.model_validate(config.get("workbench", {}).get("context", {}))
     with WorkbenchServer(port, workspace, config) as server:
@@ -968,8 +1181,7 @@ def main(
             for session in sessions:
                 if session.worker is not None:
                     session.worker.join(timeout=2)
-                if session.config.backend == "docker" and session.workspace is not None:
-                    session.workspace.env.cleanup()
+                session.cleanup()
 
 
 if __name__ == "__main__":

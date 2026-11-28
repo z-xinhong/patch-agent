@@ -1,0 +1,20 @@
+agent:
+  step_limit: 30
+  cost_limit: 3.0
+
+environment:
+  timeout: 60
+
+workbench:
+  backend: local
+  context:
+    strategy: evidence
+    search_evidence: true
+    context_window: 65536
+    output_reserve: 4096
+    recent_groups: 2
+    limit_tool_output: true
+    tool_output_tokens: 1500
+    compact_prompt: true
+    cross_turn_memory_tokens: 400
+    summary_input_tokens: 1200
